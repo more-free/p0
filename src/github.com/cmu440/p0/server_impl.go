@@ -1,5 +1,3 @@
-// Implementation of a MultiEchoServer. Students should write their code in this file.
-
 package p0
 
 import (
@@ -9,23 +7,21 @@ import (
 )
 
 const (
-	WORKER_OUT_BUFFER = 100
+	CLIENT_WRITE_BUFFER = 100
 )
 
 type worker struct {
 	id              int
 	conn            net.Conn
-	clientReadChan  chan []byte
 	clientWriteChan chan []byte // buffered
-	closeChan       chan bool
 }
 
 type multiEchoServer struct {
-	workerClose chan int      // receive id when a worker is closed
-	workerAdd   chan *worker  // receive id when a worker is created
-	workerCnt   chan chan int // receive query about worker count
-	workerMsg   chan []byte   // receive message when a worker receives a message from its client
-	masterClose chan bool
+	workerClose chan int     // receive id when a worker is closed
+	workerAdd   chan *worker // receive id when a worker is created
+	workerCnt   chan int     // receive query about worker count
+	workerMsg   chan []byte  // receive message when a worker receives a message from its client
+	closeChan   chan bool    // receive signal to close the server
 }
 
 // New creates and returns (but does not start) a new MultiEchoServer.
@@ -33,7 +29,7 @@ func New() MultiEchoServer {
 	return &multiEchoServer{
 		make(chan int),
 		make(chan *worker),
-		make(chan chan int),
+		make(chan int),
 		make(chan []byte),
 		make(chan bool),
 	}
@@ -47,13 +43,13 @@ func (mes *multiEchoServer) Start(port int) error {
 	}
 	fmt.Printf("Start listening on port %v\n", port)
 
-	go mes.listenWorker(ln)
-	go mes.listenClient(ln)
+	go mes.handleEvents(ln)
+	go mes.handleConn(ln)
 	return nil
 }
 
-// receive either data or status change from worker
-func (mes *multiEchoServer) listenWorker(ln net.Listener) {
+// main event handler for the master
+func (mes *multiEchoServer) handleEvents(ln net.Listener) {
 	workers := make(map[int]*worker)
 
 	for {
@@ -64,8 +60,8 @@ func (mes *multiEchoServer) listenWorker(ln net.Listener) {
 		case worker := <-mes.workerAdd:
 			workers[worker.id] = worker
 
-		case cntChan := <-mes.workerCnt:
-			cntChan <- len(workers)
+		case <-mes.workerCnt:
+			mes.workerCnt <- len(workers)
 
 		case msg := <-mes.workerMsg:
 			// echo to all workers
@@ -77,75 +73,50 @@ func (mes *multiEchoServer) listenWorker(ln net.Listener) {
 				}
 			}
 
-		case <-mes.masterClose:
+		case <-mes.closeChan:
 			ln.Close()
 			for _, worker := range workers {
-				worker.closeChan <- true
+				worker.conn.Close()
+				close(worker.clientWriteChan)
 			}
 			return
 		}
 	}
 }
 
-func (mes *multiEchoServer) listenClient(ln net.Listener) {
+func (mes *multiEchoServer) handleConn(ln net.Listener) {
 	for id := 0; ; id++ {
 		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Println("Exiting client listener")
+			fmt.Println("Exiting connection listener")
 			break
 		}
 
 		worker := &worker{
 			id,
 			conn,
-			make(chan []byte),
-			make(chan []byte, WORKER_OUT_BUFFER),
-			make(chan bool),
+			make(chan []byte, CLIENT_WRITE_BUFFER),
 		}
 
 		mes.workerAdd <- worker
 
-		go worker.start(mes)
+		go worker.readConn(mes)
+		go worker.writeConn() // using a separate go routine to make it non-blocking for slow clients
 	}
 }
 
-func (w *worker) start(mes *multiEchoServer) {
-	go w.readConn()
-	go w.writeConn() // running in another go routine makes it non-blocking by slow clients
-
-	closeSelf := func() {
-		close(w.clientWriteChan)
-		mes.workerClose <- w.id
-	}
-
-	for {
-		select {
-		case msg, more := <-w.clientReadChan:
-			if !more {
-				closeSelf()
-				return
-			}
-			mes.workerMsg <- msg
-
-		case <-w.closeChan:
-			w.conn.Close()
-			closeSelf()
-			return
-		}
-	}
-}
-
-func (w *worker) readConn() {
+func (w *worker) readConn(mes *multiEchoServer) {
 	reader := bufio.NewReader(w.conn)
 	for {
 		line, err := reader.ReadBytes('\n')
 
-		// either client closes itself actively or worker closes the conn
+		// either client closes itself actively or master closes the connection
 		if err != nil {
-			close(w.clientReadChan)
-			break
+			fmt.Println("Connection is closing due to", err)
+			w.closeSelf(mes)
+			return
 		} else {
-			w.clientReadChan <- line
+			mes.workerMsg <- line
 		}
 	}
 }
@@ -154,7 +125,7 @@ func (w *worker) writeConn() {
 	for {
 		select {
 		case msg, more := <-w.clientWriteChan:
-			if !more {
+			if !more { // master close the connection (and so close the clientWriteChan)
 				return
 			}
 			_, err := w.conn.Write(msg)
@@ -165,12 +136,17 @@ func (w *worker) writeConn() {
 	}
 }
 
+func (w *worker) closeSelf(mes *multiEchoServer) {
+	mes.workerClose <- w.id
+	w.conn.Close()
+	close(w.clientWriteChan)
+}
+
 func (mes *multiEchoServer) Close() {
-	mes.masterClose <- true
+	mes.closeChan <- true
 }
 
 func (mes *multiEchoServer) Count() int {
-	cntChan := make(chan int)
-	mes.workerCnt <- cntChan
-	return <-cntChan
+	mes.workerCnt <- -1
+	return <-mes.workerCnt
 }
