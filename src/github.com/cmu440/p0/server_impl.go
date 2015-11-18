@@ -21,19 +21,19 @@ type worker struct {
 }
 
 type multiEchoServer struct {
-	ln          net.Listener
-	workers     map[int]*worker
-	workerClose chan int    // receive id when a worker is closed
-	workerMsg   chan []byte // receive message when a worker receives a message from its client
+	workerClose chan int      // receive id when a worker is closed
+	workerAdd   chan *worker  // receive id when a worker is created
+	workerCnt   chan chan int // receive query about worker count
+	workerMsg   chan []byte   // receive message when a worker receives a message from its client
 	masterClose chan bool
 }
 
 // New creates and returns (but does not start) a new MultiEchoServer.
 func New() MultiEchoServer {
 	return &multiEchoServer{
-		nil,
-		make(map[int]*worker),
 		make(chan int),
+		make(chan *worker),
+		make(chan chan int),
 		make(chan []byte),
 		make(chan bool),
 	}
@@ -47,22 +47,29 @@ func (mes *multiEchoServer) Start(port int) error {
 	}
 	fmt.Printf("Start listening on port %v\n", port)
 
-	mes.ln = ln
-	go mes.listenWorker()
-	go mes.listenClient()
+	go mes.listenWorker(ln)
+	go mes.listenClient(ln)
 	return nil
 }
 
 // receive either data or status change from worker
-func (mes *multiEchoServer) listenWorker() {
+func (mes *multiEchoServer) listenWorker(ln net.Listener) {
+	workers := make(map[int]*worker)
+
 	for {
 		select {
 		case id := <-mes.workerClose:
-			delete(mes.workers, id)
+			delete(workers, id)
+
+		case worker := <-mes.workerAdd:
+			workers[worker.id] = worker
+
+		case cntChan := <-mes.workerCnt:
+			cntChan <- len(workers)
 
 		case msg := <-mes.workerMsg:
 			// echo to all workers
-			for id, worker := range mes.workers {
+			for id, worker := range workers {
 				select {
 				case worker.clientWriteChan <- msg:
 				default:
@@ -71,7 +78,8 @@ func (mes *multiEchoServer) listenWorker() {
 			}
 
 		case <-mes.masterClose:
-			for _, worker := range mes.workers {
+			ln.Close()
+			for _, worker := range workers {
 				worker.closeChan <- true
 			}
 			return
@@ -79,9 +87,9 @@ func (mes *multiEchoServer) listenWorker() {
 	}
 }
 
-func (mes *multiEchoServer) listenClient() {
+func (mes *multiEchoServer) listenClient(ln net.Listener) {
 	for id := 0; ; id++ {
-		conn, err := mes.ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			fmt.Println("Exiting client listener")
 			break
@@ -94,7 +102,8 @@ func (mes *multiEchoServer) listenClient() {
 			make(chan []byte, WORKER_OUT_BUFFER),
 			make(chan bool),
 		}
-		mes.workers[id] = worker
+
+		mes.workerAdd <- worker
 
 		go worker.start(mes)
 	}
@@ -157,14 +166,11 @@ func (w *worker) writeConn() {
 }
 
 func (mes *multiEchoServer) Close() {
-	mes.ln.Close()
 	mes.masterClose <- true
-	mes.ln = nil
 }
 
 func (mes *multiEchoServer) Count() int {
-	if mes.ln == nil {
-		return -1 // either not started or closed
-	}
-	return len(mes.workers)
+	cntChan := make(chan int)
+	mes.workerCnt <- cntChan
+	return <-cntChan
 }
