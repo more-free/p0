@@ -52,10 +52,17 @@ func (mes *multiEchoServer) Start(port int) error {
 func (mes *multiEchoServer) handleEvents(ln net.Listener) {
 	workers := make(map[int]*worker)
 
+	closeWorker := func(id int) {
+		w := workers[id]
+		w.conn.Close()
+		close(w.clientWriteChan)
+		delete(workers, id)
+	}
+
 	for {
 		select {
 		case id := <-mes.workerClose:
-			delete(workers, id)
+			closeWorker(id)
 
 		case worker := <-mes.workerAdd:
 			workers[worker.id] = worker
@@ -113,7 +120,11 @@ func (w *worker) readConn(mes *multiEchoServer) {
 		// either client closes itself actively or master closes the connection
 		if err != nil {
 			fmt.Println("Connection is closing due to", err)
-			w.closeSelf(mes)
+
+			// request master to close itself
+			mes.workerClose <- w.id
+
+			// quit this go routine
 			return
 		} else {
 			mes.workerMsg <- line
@@ -134,12 +145,6 @@ func (w *worker) writeConn() {
 			}
 		}
 	}
-}
-
-func (w *worker) closeSelf(mes *multiEchoServer) {
-	mes.workerClose <- w.id
-	w.conn.Close()
-	close(w.clientWriteChan)
 }
 
 func (mes *multiEchoServer) Close() {
